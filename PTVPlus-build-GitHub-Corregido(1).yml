@@ -1,0 +1,143 @@
+name: "PTV Plus Windows - Compilación y diagnóstico"
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+      - "src/**"
+      - "**/PTVPlus.csproj"
+      - "**/PTVPlus-Windows*.zip"
+      - "PTVPlus-Windows*.zip"
+
+permissions:
+  contents: read
+
+jobs:
+  ptvplus-windows:
+    name: "PTVPlus Windows 1.0.3"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      DOTNET_NOLOGO: "1"
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    steps:
+      - name: "Descargar archivos del repositorio"
+        uses: actions/checkout@v5
+
+      - name: "Encontrar proyecto (carpetas o ZIP)"
+        id: proyecto
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path "logs" -Force | Out-Null
+          Write-Host "Carpeta raíz: $PWD"
+          Get-ChildItem -Force | Select-Object Name,Length,Mode | Format-Table | Out-String | Write-Host
+
+          $found = @(Get-ChildItem -Path . -Recurse -File -Filter "PTVPlus.csproj" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.FullName -notmatch '[\\/](bin|obj|resultado)[\\/]' })
+          if ($found.Count -eq 0) {
+            Write-Host "No se encontró el proyecto extraído. Buscando un ZIP de PTV Plus..."
+            $zips = @(Get-ChildItem -Path . -Recurse -File -Filter '*.zip' |
+                      Where-Object { $_.Name -like 'PTVPlus-Windows*.zip' } |
+                      Sort-Object @{Expression={ if ($_.Name -match '1[.]0[.]3') { 1 } else { 0 } };Descending=$true},
+                                  @{Expression='LastWriteTime';Descending=$true})
+            if ($zips.Count -eq 0) {
+              throw "No hay PTVPlus.csproj ni archivo PTVPlus-Windows*.zip. Sube el contenido del ZIP o el ZIP completo al repositorio."
+            }
+            $zip = $zips[0]
+            Write-Host "Extrayendo: $($zip.FullName)"
+            $unpack = Join-Path $env:RUNNER_TEMP 'ptvplus-fuentes'
+            New-Item -ItemType Directory -Path $unpack -Force | Out-Null
+            Expand-Archive -LiteralPath $zip.FullName -DestinationPath $unpack -Force
+            $found = @(Get-ChildItem -Path $unpack -Recurse -File -Filter 'PTVPlus.csproj')
+          }
+          if ($found.Count -eq 0) {
+            throw "El ZIP no incluye PTVPlus.csproj. Revisa que sea el ZIP del proyecto fuente."
+          }
+          $proj = $found[0].FullName
+          $folder = Split-Path $proj -Parent
+          Write-Host "Proyecto seleccionado: $proj"
+          "project=$proj" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "folder=$folder" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "Proyecto: $proj" | Set-Content "logs/ubicacion.txt"
+          Get-ChildItem -Path $folder -Force | Select-Object Name | Format-Table | Out-String |
+              Add-Content "logs/ubicacion.txt"
+
+      - name: "Configurar .NET 10 (Windows)"
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: "Comprobar .NET y archivos del proyecto"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet --info | Out-File logs/dotnet-info.txt -Encoding utf8
+          Get-Content logs/dotnet-info.txt | Write-Host
+          $dir = '${{ steps.proyecto.outputs.folder }}'
+          $needed = @('UI/Pages/LivePage.cs','UI/Pages/PlayerPage.cs',
+                      'UI/Pages/HomePage.cs','UI/Pages/MultiPage.cs')
+          foreach ($f in $needed) {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "Falta: $f" }
+          }
+
+      - name: "Descargar motor libmpv oficial y comprobar SHA256"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $folder = '${{ steps.proyecto.outputs.folder }}'
+          $target = Join-Path $folder 'libmpv-2.dll'
+          if (-not (Test-Path $target)) {
+            $url = 'https://github.com/mpv-player/mpv/releases/download/v0.42.0/libmpv-v0.42.0-x86_64-w64-mingw32-lgpl.zip'
+            $file = Join-Path $env:RUNNER_TEMP 'ptvplus-libmpv.zip'
+            Write-Host "Descargando libmpv 0.42.0 oficial..."
+            Invoke-WebRequest -Uri $url -OutFile $file -MaximumRedirection 10
+            $expected = '8e5f77430efc53ef175804ba6618527e3af0448a0dcabf04d3cc72659d1a6fce'
+            $actual = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "SHA256: $actual"
+            if ($actual -ne $expected) { throw "SHA256 incorrecto. Descarga incompleta o modificada: $actual" }
+            $unpack = Join-Path $env:RUNNER_TEMP 'ptvplus-mpv'
+            Expand-Archive -LiteralPath $file -DestinationPath $unpack -Force
+            $dll = Get-ChildItem $unpack -Recurse -Filter 'libmpv-2.dll' -File | Select-Object -First 1
+            if (-not $dll) { throw "No se encontró libmpv-2.dll dentro del paquete." }
+            Copy-Item $dll.FullName $target -Force
+            $vulkan = Get-ChildItem $unpack -Recurse -Filter 'vulkan-1.dll' -File | Select-Object -First 1
+            if ($vulkan) { Copy-Item $vulkan.FullName (Join-Path $folder 'vulkan-1.dll') -Force }
+          }
+          Write-Host "Motor multimedia localizado en $target"
+
+      - name: "Compilar PTVPlus.exe y guardar errores"
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $project = '${{ steps.proyecto.outputs.project }}'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'resultado'
+          Write-Host "Compilando: $project"
+          & dotnet publish $project --configuration Release --runtime win-x64 --self-contained true --output $out `
+            -p:PublishReadyToRun=false -p:DebugType=none 2>&1 |
+            Tee-Object -FilePath 'logs/compilacion.txt'
+          $result = $LASTEXITCODE
+          if ($result -ne 0) {
+            Write-Host "::error::Falló dotnet publish (código $result). Abre el paso 'Compilar PTVPlus.exe' y descarga los logs del trabajo."
+            exit $result
+          }
+          if (-not (Test-Path (Join-Path $out 'PTVPlus.exe'))) {
+            throw "dotnet publish terminó, pero no existe resultado/PTVPlus.exe"
+          }
+          Get-Item (Join-Path $out 'PTVPlus.exe') | Select-Object FullName,Length | Format-Table | Out-String | Write-Host
+
+      - name: "Descargar ejecutable Windows"
+        uses: actions/upload-artifact@v6
+        with:
+          name: "PTVPlus-Windows-1.0.3-EXE"
+          path: "resultado/PTVPlus.exe"
+          if-no-files-found: error
+
+      - name: "Entregar registro si falla la compilación"
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: "PTVPlus-REGISTRO-DEL-ERROR"
+          path: "logs/**"
+          if-no-files-found: warn
