@@ -1,0 +1,52 @@
+name: Compilar PTV PLUS Windows
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Abrir el proyecto (zip subido)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path src/PTVPlus/PTVPlus.csproj)) {
+            $z = Get-Item PTVPlus-Windows.zip -ErrorAction SilentlyContinue
+            if ($null -eq $z) { $z = Get-ChildItem -Filter *.zip | Select-Object -First 1 }
+            if ($null -eq $z) { Write-Error "Sube primero el zip del proyecto"; exit 1 }
+            Expand-Archive $z.FullName -DestinationPath . -Force
+          }
+      - name: Motor de video (libmpv)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path mpvdl | Out-Null
+          $ok = $false
+          foreach ($s in @(@('shinchiro/mpv-winbuild-cmake','mpv-dev-x86_64-2*.7z'), @('zhongfly/mpv-winbuild','mpv-dev-x86_64-2*.7z'), @('shinchiro/mpv-winbuild-cmake','mpv-dev-x86_64-v3-*.7z'), @('zhongfly/mpv-winbuild','mpv-dev-x86_64-*.7z'))) {
+            Remove-Item mpvdl/* -Recurse -Force -ErrorAction SilentlyContinue
+            gh release download --repo $s[0] --pattern $s[1] --dir mpvdl --clobber
+            $a = Get-ChildItem mpvdl -Filter *.7z | Select-Object -First 1
+            if ($null -eq $a) { continue }
+            7z x $a.FullName -ompvdl/x -y | Out-Null
+            $dll = Get-ChildItem mpvdl/x -Recurse -Filter libmpv-2.dll | Select-Object -First 1
+            if ($null -ne $dll) { Copy-Item $dll.FullName src/PTVPlus/libmpv-2.dll -Force; Write-Host "libmpv: $($a.Name)"; $ok = $true; break }
+          }
+          if (-not $ok) { Write-Error "No se pudo descargar libmpv-2.dll"; exit 1 }
+          exit 0
+      - name: Compilar PTVPlus.exe
+        run: dotnet publish src/PTVPlus/PTVPlus.csproj -c Release -o out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PTVPlus-Windows
+          path: out/PTVPlus.exe
+      - name: Publicar en Releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "v1.0.${{ github.run_number }}" out/PTVPlus.exe --title "PTV PLUS Windows 1.0.${{ github.run_number }}" --notes "Descarga PTVPlus.exe y ábrelo (Windows 10/11 de 64 bits)."
